@@ -1,15 +1,78 @@
 local ts = vim.treesitter
 local get_node_range = ts.get_node_range
 if ts.get_node_range == nil then
-  get_node_range = require("nvim-treesitter.ts_utils").get_node_range
+  -- Fallback for older Neovim versions
+  get_node_range = function(node)
+    local sr, sc, er, ec = node:range()
+    return sr, sc, er, ec
+  end
 end
-local query = require("nvim-treesitter.query")
 
 local any = require("femaco.utils").any
 local clip_val = require("femaco.utils").clip_val
 local settings = require("femaco.config").settings
 
 local M = {}
+
+-- Replacement for the removed nvim-treesitter.query.get_matches
+-- Uses Neovim's built-in treesitter API
+local function get_injection_matches(bufnr)
+  local ok, parser = pcall(vim.treesitter.get_parser, bufnr)
+  if not ok or not parser then
+    return {}
+  end
+
+  local matches = {}
+  local lang = parser:lang()
+
+  -- Get the injections query for this language
+  local query_ok, query = pcall(vim.treesitter.query.get, lang, "injections")
+  if not query_ok or not query then
+    return {}
+  end
+
+  -- Parse and get trees
+  local trees = parser:trees()
+  for _, tree in ipairs(trees) do
+    local root = tree:root()
+
+    -- Iterate through query matches
+    for pattern, match, metadata in query:iter_matches(root, bufnr, 0, -1, { all = true }) do
+      local match_data = { metadata = metadata }
+
+      for id, nodes in pairs(match) do
+        local name = query.captures[id]
+        -- Handle both single node and table of nodes
+        local node = type(nodes) == "table" and nodes[1] or nodes
+
+        if name == "injection.language" then
+          match_data.language = { node = node, metadata = metadata }
+          match_data._lang = vim.treesitter.get_node_text(node, bufnr)
+        elseif name == "injection.content" then
+          match_data.content = { node = node, metadata = metadata }
+          match_data.injection = match_data.injection or {}
+          match_data.injection.content = { node = node, metadata = metadata }
+        elseif name:match("^[%w_]+$") and not name:match("^injection%.") then
+          -- Legacy format: capture name is the language itself
+          match_data[name] = { node = node, metadata = metadata }
+        end
+      end
+
+      -- Check for language set via directive metadata
+      if metadata and metadata["injection.language"] then
+        match_data._lang = metadata["injection.language"]
+        match_data.language = metadata["injection.language"]
+      end
+
+      -- Only add if we have content
+      if match_data.content or next(match_data) then
+        table.insert(matches, match_data)
+      end
+    end
+  end
+
+  return matches
+end
 
 -- Maybe we could use https://github.com/nvim-treesitter/nvim-treesitter/pull/3487
 -- if they get merged
@@ -47,19 +110,23 @@ local parse_match = function(match)
   local language = match.language or match._lang or (match.injection and match.injection.language)
   if language == nil then
     for lang, val in pairs(match) do
-      return {
-        lang = lang,
-        content = val,
-      }
+      if type(val) == "table" and val.node then
+        return {
+          lang = lang,
+          content = val,
+        }
+      end
     end
   end
   local lang
   local lang_range
   if type(language) == "string" then
     lang = language
-  else
+  elseif type(language) == "table" and language.node then
     lang = get_match_text(language, 0)
     lang_range = { get_match_range(language) }
+  else
+    lang = language
   end
   local content = match.content or (match.injection and match.injection.content)
 
@@ -85,22 +152,24 @@ local get_match_at_cursor = function()
     return range[3] == row - 1 and range[4] < col
   end
 
-  local matches = query.get_matches(vim.api.nvim_get_current_buf(), "injections")
+  local matches = get_injection_matches(vim.api.nvim_get_current_buf())
   local before_cursor = {}
   local after_cursor = {}
   for _, match in ipairs(matches) do
     local match_data = parse_match(match)
-    local content_range = { get_match_range(match_data.content) }
-    local ranges = { content_range }
-    if match_data.lang_range then
-      table.insert(ranges, match_data.lang_range)
-    end
-    if any(contains_cursor, ranges) then
-      return { lang = match_data.lang, content = match_data.content, range = content_range }
-    elseif any(is_after_cursor, ranges) then
-      table.insert(after_cursor, { lang = match_data.lang, content = match_data.content, range = content_range })
-    elseif any(is_before_cursor, ranges) then
-      table.insert(before_cursor, { lang = match_data.lang, content = match_data.content, range = content_range })
+    if match_data.content and match_data.content.node then
+      local content_range = { get_match_range(match_data.content) }
+      local ranges = { content_range }
+      if match_data.lang_range then
+        table.insert(ranges, match_data.lang_range)
+      end
+      if any(contains_cursor, ranges) then
+        return { lang = match_data.lang, content = match_data.content, range = content_range }
+      elseif any(is_after_cursor, ranges) then
+        table.insert(after_cursor, { lang = match_data.lang, content = match_data.content, range = content_range })
+      elseif any(is_before_cursor, ranges) then
+        table.insert(before_cursor, { lang = match_data.lang, content = match_data.content, range = content_range })
+      end
     end
   end
   if #after_cursor > 0 then
@@ -320,7 +389,7 @@ M.edit_code_block = function()
 
   vim.api.nvim_buf_set_lines(vim.fn.bufnr(), 0, -1, true, lines_for_edit)
   -- use nvim_exec to do this silently
-  vim.api.nvim_exec("write!", true)
+  vim.api.nvim_exec2("write!", { output = false })
   vim.api.nvim_win_set_cursor(0, float_cursor)
   settings.post_open_float(winnr)
 
