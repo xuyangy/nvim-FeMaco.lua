@@ -44,17 +44,19 @@ local function get_injection_matches(bufnr)
         local name = query.captures[id]
         -- Handle both single node and table of nodes
         local node = type(nodes) == "table" and nodes[1] or nodes
+        -- Per-capture metadata (e.g. #offset! range) is stored in metadata[id]
+        local capture_metadata = metadata[id] or {}
 
         if name == "injection.language" then
-          match_data.language = { node = node, metadata = metadata }
+          match_data.language = { node = node, metadata = capture_metadata }
           match_data._lang = vim.treesitter.get_node_text(node, bufnr)
         elseif name == "injection.content" then
-          match_data.content = { node = node, metadata = metadata }
+          match_data.content = { node = node, metadata = capture_metadata }
           match_data.injection = match_data.injection or {}
-          match_data.injection.content = { node = node, metadata = metadata }
+          match_data.injection.content = { node = node, metadata = capture_metadata }
         elseif name:match("^[%w_]+$") and not name:match("^injection%.") then
           -- Legacy format: capture name is the language itself
-          match_data[name] = { node = node, metadata = metadata }
+          match_data[name] = { node = node, metadata = capture_metadata }
         end
       end
 
